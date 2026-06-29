@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # LLM setup
-llm = ChatOllama(model="gemma3:4b", temperature=0.0, num_ctx=100000)
+llm = ChatOllama(model="qwen3-vl:8b", temperature=0.0, num_ctx=32000)
 
 # Prompt template
 reduce_template = ChatPromptTemplate.from_template(
