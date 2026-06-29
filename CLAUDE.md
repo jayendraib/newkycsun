@@ -13,9 +13,10 @@ Both jobs come in through a FastAPI API and are processed by a single worker thr
 | File | Purpose |
 |------|---------|
 | `queue_system.py` | Pure queue engine — knows nothing about KYC or Summary |
-| `app.py` | Wiring — registers processors, creates FastAPI endpoints |
+| `app.py` | Wiring — registers processors, creates FastAPI endpoints, webhook post-back |
 | `kyc.py` | KYC processor: YOLO face detection + Ollama multimodal classification |
 | `summary.py` | Summary processor: PDF download + LangChain map-reduce summarisation |
+| `flowchart.html` | Visual flowchart of the full system pipeline |
 | `requirements.txt` | All Python dependencies |
 
 ---
@@ -38,7 +39,15 @@ uvicorn app:app --reload --port 8000
 
 ```
 POST /kyc        { "zip_path": "s3://bucket/key.zip" }
-POST /summary    { "url": "https://example.com/file.pdf" }
+POST /kyc/scan   (no body) — scan s3://ib-prod-ekyc/CVLKRA/ and enqueue all unprocessed ZIPs
+POST /summary    { "url": "https://example.com/file.pdf", "news_id": 123 }
+```
+
+`/kyc/scan` uses `KYC_INPUT_BUCKET` / `KYC_INPUT_PREFIX` env vars to locate ZIPs. Already-processed ZIPs (detected via `_already_processed()`) are automatically skipped.
+
+Summary results are posted back to a webhook (`SUMMARY_WEBHOOK_URL`) with:
+```json
+{ "NewsId": 123, "AiSummary": "...", "Error": null, "StatusCode": 200 }
 ```
 
 ### Control queue at runtime
@@ -146,6 +155,8 @@ Console example:
 ```
 ZIP input (local or S3)
     ↓
+_already_processed() check — skip if CVLKRA_AI/<zip_name>/ already in S3
+    ↓
 Extract PDFs from ZIP (handles nested ZIPs)
     ↓
 Select latest valid PDF (by date pattern in filename)
@@ -154,7 +165,7 @@ Convert PDF pages to images (pdf2image, 300 DPI)
     ↓
 YOLO face detection (yolov8n-face.pt) — finds best face crop
     ↓
-LLM classification per page (qwen3-vl:8b via Ollama)
+LLM classification per page (qwen3-vl:8b via Ollama, num_ctx=32000)
     → aadhaar / pan / uncertain
     ↓
 Keep highest-confidence image per document type
@@ -162,12 +173,16 @@ Keep highest-confidence image per document type
 Upload classified images to S3 + verify upload
     ↓
 Slack alert on failure
+    ↓
+3-second pause before next ZIP (inter-ZIP rate limiting)
 ```
 
 Key classes:
 - `SmartAadharDetector` — main processor class
-- `ZipProcessingContext` — context manager tracking ZIP lifecycle stages
-- `SlackAlertManager` — sends Slack alerts only on failure
+- `ZipProcessingContext` — context manager tracking ZIP lifecycle stages (ENTRY → EXTRACTION → PROCESSING → S3_UPLOAD → VERIFICATION → CLEANUP)
+- `SlackAlertManager` — sends Slack alerts only on failure, deduplicates alerts per hour
+
+`SLACK_WEBHOOK_URL` is read from the environment variable (not hardcoded). Set it in `.env` to enable failure alerts.
 
 ---
 
@@ -180,19 +195,24 @@ download_pdf()   — async, retries 3×, streams to temp file
     ↓
 load_and_chunk() — PyPDFLoader + RecursiveCharacterTextSplitter (2500 chars)
     ↓
-summarize_docs() — LangChain map_reduce chain (gemma3:4b via Ollama)
+summarize_docs() — LangChain map_reduce chain (qwen3-vl:8b via Ollama, num_ctx=32000)
     ↓
 Returns clean summary string
+    ↓
+POST to SUMMARY_WEBHOOK_URL with { NewsId, AiSummary, Error, StatusCode }
 ```
+
+**Model change:** was `gemma3:4b` with `num_ctx=100000`; now `qwen3-vl:8b` with `num_ctx=32000` — same model as KYC.
 
 ---
 
 ## LLM Models Required (Ollama)
 
 ```bash
-ollama pull qwen3-vl:8b    # KYC classification
-ollama pull gemma3:4b      # PDF summarisation
+ollama pull qwen3-vl:8b    # KYC classification + PDF summarisation (both use this model)
 ```
+
+Both KYC and Summary now use `qwen3-vl:8b` with `num_ctx=32000`. `gemma3:4b` is no longer used.
 
 ---
 
@@ -201,9 +221,15 @@ ollama pull gemma3:4b      # PDF summarisation
 | Variable | Used By | Notes |
 |----------|---------|-------|
 | `KYC_OUTPUT_FOLDER` | `app.py` | Local output path, default `/tmp/kyc_output` |
-| `KYC_S3_BUCKET` | `app.py` | S3 bucket for KYC uploads |
+| `KYC_S3_BUCKET` | `app.py` | S3 bucket for KYC uploads, default `ib-prod-ekyc` |
+| `KYC_INPUT_BUCKET` | `app.py` | S3 bucket to scan for input ZIPs (`/kyc/scan` endpoint) |
+| `KYC_INPUT_PREFIX` | `app.py` | S3 prefix to scan for input ZIPs (e.g. `CVLKRA/`) |
 | `AWS_ACCESS_KEY_ID` | `app.py` | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | `app.py` | AWS credentials |
+| `AWS_REGION` | `app.py` | AWS region, default `ap-south-1` |
+| `SLACK_WEBHOOK_URL` | `kyc.py` | Slack incoming webhook for failure alerts. Empty = alerts disabled |
+| `SUMMARY_WEBHOOK_URL` | `app.py` | Webhook to POST summary results back to India Bonds API |
+| `SUMMARY_WEBHOOK_TOKEN` | `app.py` | Bearer token for the summary webhook |
 | `OPENAI_API_KEY` | `kyc.py` | Optional, loaded but not used directly |
 
 <!-- code-review-graph MCP tools -->

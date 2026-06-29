@@ -27,6 +27,7 @@ import traceback
 import sys
 import threading
 import psutil
+import time
 
 
 logger = logging.getLogger(__name__)
@@ -1615,7 +1616,13 @@ class SmartAadharDetector:
                     )
                 # If ctx exists, alert was already sent inside. Just re-raise.
                 raise
-            
+
+            logger.info(
+                "Pausing 3s before next ZIP...",
+                extra={"zip_name": zip_name, "trace_id": "PAUSE", "stage": "INTER_ZIP_PAUSE"},
+            )
+            time.sleep(3)
+
         return overall_results
 
 
