@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>System Flowchart</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 40px;
+    }
+    h1 { text-align: center; color: #f8fafc; margin-bottom: 32px; }
+    .mermaid {
+      background: #161b27;
+      border-radius: 12px;
+      padding: 32px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>How the Queue Works</h1>
+
+<div class="mermaid">
+flowchart TD
+    KYC_IN["📥 KYC Request\nPOST /kyc\n{ zip_path }"]
+    SUM_IN["📥 Summary Request\nPOST /summary\n{ url, news_id }"]
+
+    KYC_IN --> QUEUE
+    SUM_IN --> QUEUE
+
+    QUEUE["🗂️ Queue\nBoth jobs wait here\nFirst in, first out"]
+
+    QUEUE --> WORKER["⚙️ Worker\nRound-Robin Cycle\n\nKYC × 3 slots → Summary × 1 slot → repeat\n\nEvery cycle: process 3 KYC jobs, then 1 Summary job"]
+
+    WORKER --> KYC_PROC["🔍 KYC Processing\n\n1. Download ZIP from S3\n2. Extract PDFs\n3. Each page → YOLO + LLM classify\n4. Upload results back to S3"]
+
+    WORKER --> SUM_PROC["📄 Summary Processing\n\n1. Download PDF from URL\n2. Split into chunks\n3. LLM summarises each chunk\n4. Send final summary to webhook"]
+
+    KYC_PROC --> DONE["✅ Done"]
+    SUM_PROC --> DONE
+
+    style KYC_IN fill:#1e3a5f,stroke:#3b82f6,color:#fff
+    style SUM_IN fill:#2d1b4e,stroke:#a855f7,color:#fff
+    style QUEUE fill:#2a1f0e,stroke:#f59e0b,color:#fde68a
+    style WORKER fill:#2a1f0e,stroke:#f59e0b,color:#fde68a
+    style KYC_PROC fill:#1e3a5f,stroke:#3b82f6,color:#bfdbfe
+    style SUM_PROC fill:#2d1b4e,stroke:#a855f7,color:#e9d5ff
+    style DONE fill:#1a3a2a,stroke:#22c55e,color:#bbf7d0
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "dark",
+    flowchart: { curve: "basis", padding: 24, nodeSpacing: 60, rankSpacing: 70 }
+  });
+</script>
+</body>
+</html>

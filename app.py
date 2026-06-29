@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import boto3
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -37,8 +38,14 @@ logger = logging.getLogger(__name__)
 # ZIPs are read from:  s3://ib-prod-ekyc/CVLKRA/
 # Output is saved to:  s3://ib-prod-ekyc/CVLKRA_AI/<zip_name>/...
 
-KYC_INPUT_BUCKET = os.getenv("KYC_INPUT_BUCKET", "ib-prod-ekyc")
-KYC_INPUT_PREFIX = os.getenv("KYC_INPUT_PREFIX", "CVLKRA/")
+KYC_INPUT_BUCKET = os.getenv("KYC_INPUT_BUCKET", "")
+KYC_INPUT_PREFIX = os.getenv("KYC_INPUT_PREFIX", "")
+
+WEBHOOK_URL = os.getenv(
+    "SUMMARY_WEBHOOK_URL",
+    "",
+)
+WEBHOOK_TOKEN = os.getenv("SUMMARY_WEBHOOK_TOKEN", "")
 
 # ── Queue setup ───────────────────────────────────────────────────────────────
 
@@ -91,7 +98,32 @@ def _list_zips_from_s3(bucket: str, prefix: str) -> list[str]:
 # ── Summary processor ──────────────────────────────────────────────────────────
 
 async def summary_handler(data: dict) -> dict:
-    return await process_url(data["url"])
+    result = await process_url(data["url"])
+
+    has_error = "error" in result
+    summary_text = result.get("summary", "")
+    unable_to_summarise = "Sorry we are unable to summarise this pdf" in summary_text
+
+    if has_error:
+        payload = {"NewsId": data["news_id"], "AiSummary": None, "Error": result["error"], "StatusCode": 500}
+    elif unable_to_summarise:
+        payload = {"NewsId": data["news_id"], "AiSummary": None, "Error": summary_text, "StatusCode": 400}
+    else:
+        payload = {"NewsId": data["news_id"], "AiSummary": summary_text, "Error": None, "StatusCode": 200}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                WEBHOOK_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {WEBHOOK_TOKEN}", "Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            logger.info(f"Webhook posted for news_id={data['news_id']}: {resp.status_code}")
+    except Exception as exc:
+        logger.error(f"Webhook failed for news_id={data['news_id']}: {exc}")
+
+    return result
 
 
 # ── Register processors ───────────────────────────────────────────────────────
@@ -130,6 +162,7 @@ class KycRequest(BaseModel):
 
 class SummaryRequest(BaseModel):
     url: str                # PDF URL to download and summarise
+    news_id: int            # news record ID — echoed back in the webhook payload
 
 
 class PriorityUpdate(BaseModel):
@@ -180,7 +213,7 @@ def scan_and_enqueue():
 
 @app.post("/summary")
 def submit_summary(req: SummaryRequest):
-    item_id = queue.enqueue("summary", {"url": req.url})
+    item_id = queue.enqueue("summary", {"url": req.url, "news_id": req.news_id})
     return {"item_id": item_id, "status": "queued"}
 
 

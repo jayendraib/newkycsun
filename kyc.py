@@ -45,7 +45,7 @@ def upload_to_s3(local_zip_path, s3_bucket, s3_key):
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SLACK_WEBHOOK_URL = "" 
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 LOG_LEVEL = "DEBUG"
 
