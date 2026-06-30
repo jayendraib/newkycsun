@@ -132,7 +132,7 @@ class QueueManager:
         self._processors: dict[str, ProcessorEntry] = {}
         self._lock = threading.Lock()
         self._running = False
-        self._worker_thread: threading.Thread | None = None
+        self._worker_threads: list[threading.Thread] = []
         self._color_idx = 0
 
         # ── SQLite disk queue ─────────────────────────────────────────────────
@@ -343,15 +343,6 @@ class QueueManager:
                 }
             return result
 
-    def _log_cycle_status(self, label: str) -> None:
-        with self._lock:
-            parts = "  |  ".join(
-                f"{n}(p={self._processors[n].priority}, s={self._processors[n].slots}, "
-                f"q={self._db.execute('SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status=?', (n, 'pending')).fetchone()[0]})"
-                for n in sorted(self._processors, key=lambda x: self._processors[x].priority)
-            )
-        self._mgr_logger.info(f"{label}  →  {parts or 'no processors'}")
-
     # ── Item execution ────────────────────────────────────────────────────────
 
     def _run_item(self, item: QueueItem, slot_num: int, total_slots: int) -> None:
@@ -362,11 +353,8 @@ class QueueManager:
         sep = "─" * 50
 
         log.info(sep)
-        log.info(
-            f"START  {item.item_id}  "
-            f"[slot {slot_num}/{total_slots}]  "
-            f"waited {wait:.2f}s"
-        )
+        slot_label = f"job #{slot_num}" if total_slots == -1 else f"slot {slot_num}/{total_slots}"
+        log.info(f"START  {item.item_id}  [{slot_label}]  waited {wait:.2f}s")
         self._mgr_logger.info(
             f"▶ [{item.processor_name.upper()}] {item.item_id}  "
             f"slot {slot_num}/{total_slots}"
@@ -398,59 +386,29 @@ class QueueManager:
         finally:
             log.info(sep)
 
-    # ── Worker (weighted round-robin) ─────────────────────────────────────────
+    # ── Worker (per-processor, concurrent) ────────────────────────────────────
 
-    def _worker(self) -> None:
-        self._mgr_logger.info("Worker started  (weighted round-robin, disk-backed)")
+    def _processor_worker(self, name: str) -> None:
+        """Dedicated worker thread for a single processor type — runs concurrently with others."""
+        entry = self._processors[name]
         idle_logged = False
-        cycle = 0
+        job_num = 0
 
+        self._mgr_logger.info(f"Worker started for '{name}'")
         while self._running:
-            with self._lock:
-                ordered_names = sorted(
-                    self._processors,
-                    key=lambda n: self._processors[n].priority,
-                )
-
-            cycle_processed = 0
-
-            for name in ordered_names:
-                with self._lock:
-                    slots = self._processors[name].slots
-
-                slot_count = 0
-                while slot_count < slots:
-                    item = self._pop_item(name)
-                    if item is None:
-                        break
-
-                    slot_count += 1
-                    cycle_processed += 1
-                    self._run_item(item, slot_count, slots)
-
-                if slot_count > 0:
-                    with self._lock:
-                        remaining = self._db.execute(
-                            "SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status='pending'",
-                            (name,),
-                        ).fetchone()[0]
-                    self._processors[name].logger.info(
-                        f"Cycle {cycle}: processed {slot_count}/{slots} slots  "
-                        f"|  {remaining} remaining in queue"
-                    )
-
-            if cycle_processed == 0:
+            item = self._pop_item(name)
+            if item is None:
                 if not idle_logged:
-                    self._mgr_logger.info("Idle — all queues empty, waiting...")
+                    entry.logger.info("Idle — queue empty, waiting for jobs...")
                     idle_logged = True
                 time.sleep(0.05)
                 continue
 
             idle_logged = False
-            cycle += 1
-            self._log_cycle_status(f"Cycle {cycle} done")
+            job_num += 1
+            self._run_item(item, job_num, -1)  # -1 signals continuous (not slot-bounded) mode
 
-        self._mgr_logger.info("Worker stopped")
+        entry.logger.info(f"Worker stopped after {job_num} jobs")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -458,16 +416,25 @@ class QueueManager:
         if self._running:
             return
         self._running = True
-        self._worker_thread = threading.Thread(
-            target=self._worker, daemon=True, name="queue-worker"
+        self._worker_threads = []
+        for name in list(self._processors.keys()):
+            t = threading.Thread(
+                target=self._processor_worker,
+                args=(name,),
+                daemon=True,
+                name=f"queue-worker-{name}",
+            )
+            self._worker_threads.append(t)
+            t.start()
+        self._mgr_logger.info(
+            f"QueueManager started — {len(self._worker_threads)} parallel workers "
+            f"({', '.join(self._processors.keys())})"
         )
-        self._worker_thread.start()
-        self._mgr_logger.info("QueueManager started")
 
     def stop(self, timeout: float = 10.0) -> None:
-        self._mgr_logger.info("Stopping...")
+        self._mgr_logger.info("Stopping all workers...")
         self._running = False
-        if self._worker_thread:
-            self._worker_thread.join(timeout=timeout)
+        for t in self._worker_threads:
+            t.join(timeout=timeout)
         self._db.close()
         self._mgr_logger.info("QueueManager stopped")

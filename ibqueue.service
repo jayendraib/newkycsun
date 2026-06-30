@@ -1,0 +1,14 @@
+[Unit]
+Description=IB Processing Queue (KYC + Summary)
+After=network.target
+
+[Service]
+User=jayendra
+WorkingDirectory=/home/jayendra/jayendraproject/clean-newkycsun
+EnvironmentFile=/home/jayendra/jayendraproject/clean-newkycsun/.env
+ExecStart=/home/jayendra/.local/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

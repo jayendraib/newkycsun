@@ -23,7 +23,7 @@ from pathlib import Path
 import boto3
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from queue_system import QueueManager
@@ -46,6 +46,12 @@ WEBHOOK_URL = os.getenv(
     "",
 )
 WEBHOOK_TOKEN = os.getenv("SUMMARY_WEBHOOK_TOKEN", "")
+
+KYC_AUTH_ID = os.getenv("KYC_AUTH_ID", "2f8f114c-e61e-41dc-b158-f6f25a121006")
+KYC_WEBHOOK_URL = os.getenv(
+    "KYC_WEBHOOK_URL",
+    "https://kycapi.indiabonds.com/api/client/kra/documentfetchupdate",
+)
 
 # ── Queue setup ───────────────────────────────────────────────────────────────
 
@@ -73,8 +79,30 @@ def kyc_handler(data: dict) -> dict:
 
     if zip_path.startswith("s3://"):
         local_zip_path = detector.download_from_s3(zip_path)
-        return detector.process_zip_as_one(str(local_zip_path))
-    return detector.process_zip_as_one(zip_path)
+        result = detector.process_zip_as_one(str(local_zip_path))
+    else:
+        result = detector.process_zip_as_one(zip_path)
+
+    # Only notify KYC completion webhook when valid documents were actually found
+    # (matches ib_ai_news_summary/tasks/kyc_processor_task.py behaviour)
+    has_valid_docs = (
+        len(result.get("aadhaar", [])) > 0
+        or len(result.get("pan", [])) > 0
+        or len(result.get("userimage", [])) > 0
+    )
+    if has_valid_docs:
+        file_name = zip_name.stem  # filename without .zip extension
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(KYC_WEBHOOK_URL, json={"fileName": file_name})
+                resp.raise_for_status()
+                logger.info(f"KYC webhook notified: {file_name} → {resp.status_code}")
+        except Exception as exc:
+            logger.error(f"KYC webhook failed for {file_name}: {exc}")
+    else:
+        logger.info(f"No valid docs found for {zip_name}, skipping KYC webhook")
+
+    return result
 
 
 def _list_zips_from_s3(bucket: str, prefix: str) -> list[str]:
@@ -138,7 +166,7 @@ async def summary_handler(data: dict) -> dict:
 #   def ocr_handler(data): ...
 #   queue.register_processor("ocr", ocr_handler, priority=3, slots=2)
 
-queue.register_processor("kyc",     kyc_handler,     priority=1, slots=3)
+queue.register_processor("kyc",     kyc_handler,     priority=1, slots=3) #this creates two empty queues in ram
 queue.register_processor("summary", summary_handler, priority=2, slots=1)
 
 
@@ -151,13 +179,20 @@ async def lifespan(app: FastAPI):
     queue.stop()
 
 
-app = FastAPI(title="IB Processing Queue", lifespan=lifespan)
+app = FastAPI(
+    title="IB Processing Queue",
+    lifespan=lifespan,
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+)
 
 
 # ── Request/update models ─────────────────────────────────────────────────────
 
 class KycRequest(BaseModel):
-    zip_path: str           # local path OR s3://bucket/key
+    bucket_name: str        # output S3 bucket, e.g. "CVLKRA_AI"
+    aws_region: str         # e.g. "ap-south-1"
+    zip_s3_path: str        # full S3 path, e.g. "s3://bucket/path/file.zip"
 
 
 class SummaryRequest(BaseModel):
@@ -181,19 +216,19 @@ class SlotsUpdate(BaseModel):
 #       item_id = queue.enqueue("ocr", {"file": req.file})
 #       return {"item_id": item_id, "status": "queued"}
 
-@app.post("/kyc")
-def submit_kyc(req: KycRequest):
-    item_id = queue.enqueue("kyc", {"zip_path": req.zip_path})
+@app.post("/api/kyc/document/processor/") #here kyc job added to the queue
+def submit_kyc(req: KycRequest, auth_id: str | None = Header(None, alias="auth-id")):
+    if auth_id != KYC_AUTH_ID:
+        raise HTTPException(status_code=401, detail="Invalid or missing auth-id header")
+    item_id = queue.enqueue("kyc", {"zip_path": req.zip_s3_path})
     return {"item_id": item_id, "status": "queued"}
 
 
-@app.post("/kyc/scan")
-def scan_and_enqueue():
-    """
-    Scan s3://ib-prod-ekyc/CVLKRA/ for all .zip files and enqueue
-    any that have not been processed yet (no output in CVLKRA_AI/).
-    Already-processed ZIPs are skipped automatically by kyc_handler.
-    """
+@app.post("/api/kyc/scan")
+def scan_and_enqueue(auth_id: str | None = Header(None, alias="auth-id")):
+    """Scan s3://ib-prod-ekyc/CVLKRA/ for all .zip files and enqueue any that have not been processed yet."""
+    if auth_id != KYC_AUTH_ID:
+        raise HTTPException(status_code=401, detail="Invalid or missing auth-id header")
     try:
         all_zips = _list_zips_from_s3(KYC_INPUT_BUCKET, KYC_INPUT_PREFIX)
     except Exception as exc:
@@ -211,7 +246,7 @@ def scan_and_enqueue():
     }
 
 
-@app.post("/summary")
+@app.post("/api/sum") #summary job added
 def submit_summary(req: SummaryRequest):
     item_id = queue.enqueue("summary", {"url": req.url, "news_id": req.news_id})
     return {"item_id": item_id, "status": "queued"}
@@ -253,3 +288,8 @@ def queue_status():
     Returns current queue depths, priorities, and slots for all processors.
     """
     return queue.status()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
