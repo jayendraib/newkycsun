@@ -20,6 +20,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+import db
+
 if TYPE_CHECKING:
     from langchain_core.documents import Document
 
@@ -31,6 +33,12 @@ logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Persist all summary logs and errors to Postgres (summary_logs table).
+db.init_db()
+_pg_handler = db.PostgresLogHandler(table="summary_logs", extra_fields=("url", "news_id"))
+_pg_handler.setLevel(logging.INFO)
+logger.addHandler(_pg_handler)
 
 # LLM setup
 llm = ChatOllama(model="qwen3-vl:8b", temperature=0.0, num_ctx=32000)

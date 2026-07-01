@@ -1,16 +1,12 @@
 """
 API + queue wiring.
 
-Round-robin cycle currently set as:
-    KYC     priority=1  slots=3   →  processes 3 items per cycle
-    SUMMARY priority=2  slots=1   →  processes 1 item per cycle
-
-So for every 3 KYC items processed, 1 Summary item runs — regardless
-of how many items are queued. Neither service ever starves.
+Each incoming request just inserts the job into Postgres (queue_items table)
+and returns immediately. KYC and Summary each have their own dedicated
+worker thread that processes jobs one by one, oldest first (FIFO) — see
+queue_system.py.
 
 To add a new processor: add register_processor() below + a new endpoint.
-To change the ratio:    PUT /slots/{processor}    {"slots": N}
-To change cycle order:  PUT /priority/{processor} {"priority": N}
 """
 
 from __future__ import annotations
@@ -26,13 +22,23 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+import db
 from queue_system import QueueManager
 from kyc import SmartAadharDetector
 from summary import process_url
 
 load_dotenv()
 
+# Initialise the Postgres log tables (kyc_logs, summary_logs, queue_logs).
+db.init_db()
+
 logger = logging.getLogger(__name__)
+
+kyc_logger = logging.getLogger("app.kyc")
+kyc_logger.addHandler(db.PostgresLogHandler(table="kyc_logs", extra_fields=("zip_name",)))
+
+summary_logger = logging.getLogger("app.summary")
+summary_logger.addHandler(db.PostgresLogHandler(table="summary_logs", extra_fields=("url", "news_id")))
 
 # ── S3 input config ───────────────────────────────────────────────────────────
 # ZIPs are read from:  s3://ib-prod-ekyc/CVLKRA/
@@ -55,7 +61,7 @@ KYC_WEBHOOK_URL = os.getenv(
 
 # ── Queue setup ───────────────────────────────────────────────────────────────
 
-queue = QueueManager(log_dir=".")
+queue = QueueManager()
 
 # ── KYC processor ─────────────────────────────────────────────────────────────
 
@@ -74,14 +80,21 @@ def kyc_handler(data: dict) -> dict:
 
     # Skip if already processed (checks CVLKRA_AI/<zip_name>/ in output bucket)
     if detector._already_processed(zip_name):
-        logger.info(f"Skipping already-processed ZIP: {zip_name}")
+        kyc_logger.info(f"Skipping already-processed ZIP: {zip_name}", extra={"zip_name": str(zip_name)})
         return {"status": "skipped", "zip": str(zip_name)}
 
-    if zip_path.startswith("s3://"):
-        local_zip_path = detector.download_from_s3(zip_path)
-        result = detector.process_zip_as_one(str(local_zip_path))
-    else:
-        result = detector.process_zip_as_one(zip_path)
+    local_zip_path = None
+    try:
+        if zip_path.startswith("s3://"):
+            local_zip_path = detector.download_from_s3(zip_path)
+            result = detector.process_zip_as_one(str(local_zip_path))
+        else:
+            result = detector.process_zip_as_one(zip_path)
+    finally:
+        # Remove the downloaded zip from local disk regardless of success/failure —
+        # results already live in S3 + the webhook, nothing local needs to remain.
+        if local_zip_path is not None:
+            Path(local_zip_path).unlink(missing_ok=True)
 
     # Only notify KYC completion webhook when valid documents were actually found
     # (matches ib_ai_news_summary/tasks/kyc_processor_task.py behaviour)
@@ -96,11 +109,14 @@ def kyc_handler(data: dict) -> dict:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.post(KYC_WEBHOOK_URL, json={"fileName": file_name})
                 resp.raise_for_status()
-                logger.info(f"KYC webhook notified: {file_name} → {resp.status_code}")
+                kyc_logger.info(
+                    f"KYC webhook notified: {file_name} → {resp.status_code}",
+                    extra={"zip_name": str(zip_name)},
+                )
         except Exception as exc:
-            logger.error(f"KYC webhook failed for {file_name}: {exc}")
+            kyc_logger.error(f"KYC webhook failed for {file_name}: {exc}", extra={"zip_name": str(zip_name)})
     else:
-        logger.info(f"No valid docs found for {zip_name}, skipping KYC webhook")
+        kyc_logger.info(f"No valid docs found for {zip_name}, skipping KYC webhook", extra={"zip_name": str(zip_name)})
 
     return result
 
@@ -147,27 +163,30 @@ async def summary_handler(data: dict) -> dict:
                 headers={"Authorization": f"Bearer {WEBHOOK_TOKEN}", "Content-Type": "application/json"},
             )
             resp.raise_for_status()
-            logger.info(f"Webhook posted for news_id={data['news_id']}: {resp.status_code}")
+            summary_logger.info(
+                f"Webhook posted for news_id={data['news_id']}: {resp.status_code}",
+                extra={"url": data["url"], "news_id": data["news_id"]},
+            )
     except Exception as exc:
-        logger.error(f"Webhook failed for news_id={data['news_id']}: {exc}")
+        summary_logger.error(
+            f"Webhook failed for news_id={data['news_id']}: {exc}",
+            extra={"url": data["url"], "news_id": data["news_id"]},
+        )
 
     return result
 
 
 # ── Register processors ───────────────────────────────────────────────────────
 #
-# slots  = items processed per cycle  (controls throughput share)
-# priority = order within a cycle    (lower number runs first)
-#
-# Current config:  every cycle does [KYC×3, SUMMARY×1]
-# KYC gets 75% of throughput, Summary gets 25% — Summary never starves.
+# Each processor gets its own dedicated worker thread pulling FIFO from its
+# own slice of the queue_items table — KYC and Summary never block each other.
 #
 # To add another processor (e.g. OCR):
 #   def ocr_handler(data): ...
-#   queue.register_processor("ocr", ocr_handler, priority=3, slots=2)
+#   queue.register_processor("ocr", ocr_handler)
 
-queue.register_processor("kyc",     kyc_handler,     priority=1, slots=3) #this creates two empty queues in ram
-queue.register_processor("summary", summary_handler, priority=2, slots=1)
+queue.register_processor("kyc", kyc_handler)
+queue.register_processor("summary", summary_handler)
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -198,14 +217,6 @@ class KycRequest(BaseModel):
 class SummaryRequest(BaseModel):
     url: str                # PDF URL to download and summarise
     news_id: int            # news record ID — echoed back in the webhook payload
-
-
-class PriorityUpdate(BaseModel):
-    priority: int           # lower = earlier in each cycle
-
-
-class SlotsUpdate(BaseModel):
-    slots: int              # items this processor handles per cycle
 
 
 # ── Input endpoints ───────────────────────────────────────────────────────────
@@ -252,41 +263,9 @@ def submit_summary(req: SummaryRequest):
     return {"item_id": item_id, "status": "queued"}
 
 
-# ── Control endpoints ─────────────────────────────────────────────────────────
-
-@app.put("/slots/{processor}")
-def set_slots(processor: str, req: SlotsUpdate):
-    """
-    Change how many items this processor handles per cycle.
-
-    Example: PUT /slots/kyc  {"slots": 5}
-    Now KYC processes 5 items before yielding to Summary.
-    """
-    try:
-        queue.set_slots(processor, req.slots)
-    except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"processor": processor, "slots": req.slots}
-
-
-@app.put("/priority/{processor}")
-def set_priority(processor: str, req: PriorityUpdate):
-    """
-    Change a processor's position within each cycle.
-    Lower number = runs first in the cycle.
-    """
-    try:
-        queue.set_priority(processor, req.priority)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    return {"processor": processor, "priority": req.priority}
-
-
 @app.get("/status")
 def queue_status():
-    """
-    Returns current queue depths, priorities, and slots for all processors.
-    """
+    """Returns current queue depth + failed count for each processor."""
     return queue.status()
 
 

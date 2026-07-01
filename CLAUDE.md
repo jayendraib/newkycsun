@@ -1,10 +1,14 @@
 # CLAUDE.md — newkycsummary
 
-This project is a **weighted round-robin queue system** that processes two types of jobs:
+This project is a **Postgres-backed FIFO queue system** that processes two types of jobs:
 - **KYC** — ZIP files containing identity documents (Aadhaar, PAN), classified via YOLO + LLM
 - **Summary** — PDF URLs downloaded and summarised via LLM
 
-Both jobs come in through a FastAPI API and are processed by a single worker thread that guarantees neither service starves.
+Both jobs come in through a FastAPI API, which does nothing but insert the job into
+Postgres (`queue_items` table) and return immediately — no blocking, no API timeout.
+Each job type has its own dedicated worker thread that continuously pulls the oldest
+pending row for that type (first in, first out) and runs it, so KYC and Summary
+process concurrently and neither one starves the other.
 
 ---
 
@@ -12,10 +16,11 @@ Both jobs come in through a FastAPI API and are processed by a single worker thr
 
 | File | Purpose |
 |------|---------|
-| `queue_system.py` | Pure queue engine — knows nothing about KYC or Summary |
+| `queue_system.py` | Pure FIFO queue engine (Postgres-backed) — knows nothing about KYC or Summary |
 | `app.py` | Wiring — registers processors, creates FastAPI endpoints, webhook post-back |
 | `kyc.py` | KYC processor: YOLO face detection + Ollama multimodal classification |
 | `summary.py` | Summary processor: PDF download + LangChain map-reduce summarisation |
+| `db.py` | PostgreSQL backend — `queue_items` (the job queue itself) + `kyc_logs`, `summary_logs`, `queue_logs` (logs) |
 | `flowchart.html` | Visual flowchart of the full system pipeline |
 | `requirements.txt` | All Python dependencies |
 
@@ -38,55 +43,43 @@ uvicorn app:app --reload --port 8000
 ### Submit jobs
 
 ```
-POST /kyc        { "zip_path": "s3://bucket/key.zip" }
-POST /kyc/scan   (no body) — scan s3://ib-prod-ekyc/CVLKRA/ and enqueue all unprocessed ZIPs
-POST /summary    { "url": "https://example.com/file.pdf", "news_id": 123 }
+POST /api/kyc/document/processor/   { "bucket_name": "...", "aws_region": "ap-south-1", "zip_s3_path": "s3://bucket/key.zip" }
+                                     header: auth-id: 2f8f114c-e61e-41dc-b158-f6f25a121006
+POST /api/kyc/scan                  (no body, same auth-id header) — scan s3://ib-prod-ekyc/CVLKRA/ and enqueue all unprocessed ZIPs
+POST /api/sum                       { "url": "https://example.com/file.pdf", "news_id": 123 }
+GET  /status                        — current queue depth + failed count per processor
+GET  /health
 ```
 
-`/kyc/scan` uses `KYC_INPUT_BUCKET` / `KYC_INPUT_PREFIX` env vars to locate ZIPs. Already-processed ZIPs (detected via `_already_processed()`) are automatically skipped.
+`/api/kyc/scan` uses `KYC_INPUT_BUCKET` / `KYC_INPUT_PREFIX` env vars to locate ZIPs. Already-processed ZIPs (detected via `_already_processed()`) are automatically skipped.
 
 Summary results are posted back to a webhook (`SUMMARY_WEBHOOK_URL`) with:
 ```json
 { "NewsId": 123, "AiSummary": "...", "Error": null, "StatusCode": 200 }
 ```
 
-### Control queue at runtime
-
-```
-PUT /slots/kyc         { "slots": 3 }    # KYC processes 3 files per cycle
-PUT /slots/summary     { "slots": 1 }    # Summary processes 1 file per cycle
-PUT /priority/kyc      { "priority": 1 } # KYC runs first in each cycle
-PUT /priority/summary  { "priority": 2 } # Summary runs second in each cycle
-GET /status                              # current queue depths + settings
-```
-
 ---
 
 ## Queue Architecture
 
-**Problem solved:** When one service receives continuous input, simple priority queues cause the other service to never run (starvation).
+**Problem solved:** When one service receives continuous input, a single shared queue
+causes the other service to never run (starvation).
 
-**Solution:** Weighted round-robin with `slots`.
+**Solution:** every job type gets its own Postgres-backed FIFO queue and its own
+dedicated worker thread. No slots, no priority, no round-robin — plain FIFO per queue.
 
 ```
-One cycle = [KYC × slots_kyc → SUMMARY × slots_summary → repeat]
+queue_items (Postgres table)
+    processor_name='kyc'     → KYC worker thread     → oldest pending first → kyc.py
+    processor_name='summary' → Summary worker thread → oldest pending first → summary.py
 ```
 
-Default: `kyc slots=3, summary slots=1`
-```
-KYC  KYC  KYC  →  SUMMARY  →  KYC  KYC  KYC  →  SUMMARY  →  ...
-```
+Both threads run continuously and concurrently — 10,000 queued KYC jobs never block
+Summary, because Summary has its own thread pulling from its own slice of the table.
 
-Even with 10,000 KYC jobs queued, Summary always gets its turn every 3 KYC jobs.
-
-**How `slots` controls the ratio:**
-
-| kyc slots | summary slots | KYC share | Summary share |
-|-----------|---------------|-----------|---------------|
-| 3         | 1             | 75%       | 25%           |
-| 1         | 1             | 50%       | 50%           |
-| 10        | 1             | 91%       | 9%            |
-| 3         | 5             | 37%       | 63%           |
+Jobs are claimed atomically (`UPDATE ... WHERE item_id = (SELECT ... FOR UPDATE SKIP LOCKED)`),
+so a job is only ever picked up by one worker. If the process crashes mid-job, any row
+stuck in `processing` is reset to `pending` on the next startup — nothing is lost.
 
 ---
 
@@ -100,7 +93,7 @@ def ocr_handler(data: dict) -> dict:
 
 **Step 2** — Register it in `app.py` (one line):
 ```python
-queue.register_processor("ocr", ocr_handler, priority=3, slots=2)
+queue.register_processor("ocr", ocr_handler)
 ```
 
 **Step 3** — Add an endpoint in `app.py`:
@@ -129,23 +122,27 @@ This is safe to call from any thread.
 
 ## Logs
 
-Each processor writes to its own colour-coded stream and log file:
+Each processor still writes a colour-coded console stream, but persistent
+logs and errors go to **PostgreSQL** (`db.py`) — no local `.log` files, no
+Slack alerts. Each source has its own table:
 
-| Stream | Colour | Log File |
-|--------|--------|----------|
-| `[QUEUE]` | Yellow | `queue_manager.log` |
-| `[KYC]` | Cyan | `kyc_queue.log` |
-| `[SUMMARY]` | Magenta | `summary_queue.log` |
+| Stream | Colour | Postgres Table |
+|--------|--------|-----------------|
+| `[QUEUE]` | Yellow | `queue_logs` |
+| `[KYC]` | Cyan | `kyc_logs` |
+| `[SUMMARY]` | Magenta | `summary_logs` |
+
+The Postgres connection is configured via env vars (see below) and is
+optional — if the DB is unreachable, logging falls back to console-only so
+the pipeline never crashes on its logging backend.
 
 Console example:
 ```
-[10:42:01][QUEUE][INFO] Cycle start → kyc(p=1, s=3, q=847) | summary(p=2, s=1, q=23)
-[10:42:01][KYC  ][INFO] START kyc_104201  [slot 1/3]  waited 0.12s
+[10:42:01][QUEUE][INFO] Registered 'kyc'  pending_on_disk=847
+[10:42:01][KYC  ][INFO] START kyc_104201  [job #1]  waited 0.12s
 [10:42:44][KYC  ][INFO] DONE  kyc_104201  |  42.3s
-[10:43:28][KYC  ][INFO] Cycle 1: processed 3/3 slots  |  844 remaining
-[10:43:28][SUMM ][INFO] START summary_104301  [slot 1/1]  waited 127.5s
+[10:43:28][SUMM ][INFO] START summary_104301  [job #1]  waited 3.10s
 [10:43:44][SUMM ][INFO] DONE  summary_104301  |  15.2s
-[10:43:44][QUEUE][INFO] Cycle 1 done → kyc(q=844) | summary(q=22)
 ```
 
 ---
@@ -172,7 +169,7 @@ Keep highest-confidence image per document type
     ↓
 Upload classified images to S3 + verify upload
     ↓
-Slack alert on failure
+Failure recorded to Postgres (kyc_logs)
     ↓
 3-second pause before next ZIP (inter-ZIP rate limiting)
 ```
@@ -180,9 +177,7 @@ Slack alert on failure
 Key classes:
 - `SmartAadharDetector` — main processor class
 - `ZipProcessingContext` — context manager tracking ZIP lifecycle stages (ENTRY → EXTRACTION → PROCESSING → S3_UPLOAD → VERIFICATION → CLEANUP)
-- `SlackAlertManager` — sends Slack alerts only on failure, deduplicates alerts per hour
-
-`SLACK_WEBHOOK_URL` is read from the environment variable (not hardcoded). Set it in `.env` to enable failure alerts.
+- `record_failure()` — persists a structured failure to the `kyc_logs` table (replaces the old Slack alerting)
 
 ---
 
@@ -222,15 +217,20 @@ Both KYC and Summary now use `qwen3-vl:8b` with `num_ctx=32000`. `gemma3:4b` is 
 |----------|---------|-------|
 | `KYC_OUTPUT_FOLDER` | `app.py` | Local output path, default `/tmp/kyc_output` |
 | `KYC_S3_BUCKET` | `app.py` | S3 bucket for KYC uploads, default `ib-prod-ekyc` |
-| `KYC_INPUT_BUCKET` | `app.py` | S3 bucket to scan for input ZIPs (`/kyc/scan` endpoint) |
+| `KYC_INPUT_BUCKET` | `app.py` | S3 bucket to scan for input ZIPs (`/api/kyc/scan` endpoint) |
 | `KYC_INPUT_PREFIX` | `app.py` | S3 prefix to scan for input ZIPs (e.g. `CVLKRA/`) |
 | `AWS_ACCESS_KEY_ID` | `app.py` | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | `app.py` | AWS credentials |
 | `AWS_REGION` | `app.py` | AWS region, default `ap-south-1` |
-| `SLACK_WEBHOOK_URL` | `kyc.py` | Slack incoming webhook for failure alerts. Empty = alerts disabled |
 | `SUMMARY_WEBHOOK_URL` | `app.py` | Webhook to POST summary results back to India Bonds API |
 | `SUMMARY_WEBHOOK_TOKEN` | `app.py` | Bearer token for the summary webhook |
 | `OPENAI_API_KEY` | `kyc.py` | Optional, loaded but not used directly |
+| `DATABASE_URL` | `db.py` | Full Postgres DSN (overrides the `PG_*` vars below). Required — this is where jobs *and* logs live |
+| `PG_HOST` | `db.py` | Postgres host, default `localhost` |
+| `PG_PORT` | `db.py` | Postgres port, default `5432` |
+| `PG_DATABASE` | `db.py` | Database name, default `newkycsummary` |
+| `PG_USER` | `db.py` | Postgres user, default `postgres` |
+| `PG_PASSWORD` | `db.py` | Postgres password, default empty |
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph

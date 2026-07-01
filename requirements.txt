@@ -28,6 +28,7 @@ ollama
 httpx_retries
 celery[redis]
 redis
+psycopg2-binary
 opencv-python-headless>=4.13.0.90
 numpy>=2.4.0
 pillow>=12.0.0

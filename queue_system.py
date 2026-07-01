@@ -1,24 +1,20 @@
 """
-Pluggable weighted round-robin queue engine — disk-backed via SQLite.
+Pluggable FIFO queue engine — disk-backed via Postgres (queue_items table).
 
-All jobs are persisted to queue.db on disk. RAM usage stays flat no matter
-how many jobs are queued. Jobs survive server restarts — any job that was
-mid-processing when the server crashed is automatically reset to 'pending'.
-
-Cycle example — KYC(slots=3), SUMMARY(slots=1):
-    [KYC×3  →  SUMMARY×1  →  KYC×3  →  SUMMARY×1  → ...]
+Every job (KYC zip, summary URL, ...) is inserted into Postgres the moment
+it is enqueued — no RAM list, no SQLite file. Each processor type has its
+own dedicated worker thread that pulls the oldest pending job for that type
+(first in, first out) and runs it. Jobs survive server restarts — any job
+that was mid-processing when the server crashed is automatically reset to
+'pending'.
 
 To add a new processor:
-    queue.register_processor("ocr", ocr_handler, priority=3, slots=2)
+    queue.register_processor("ocr", ocr_handler)
 
 To add a new input source:
     queue.enqueue("ocr", {"file": "/path/to/file"})
 
-To change balance at runtime:
-    queue.set_slots("kyc", 5)       # KYC gets 5 items per cycle
-    queue.set_priority("kyc", 2)    # push KYC later in the cycle
-
-queue.db table: queue_items
+queue_items table (Postgres, see db.py):
     item_id        — unique job ID
     processor_name — "kyc" or "summary"
     data           — JSON string of the job payload
@@ -32,13 +28,15 @@ import asyncio
 import inspect
 import json
 import logging
-import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
+
+import db
 
 _RESET = "\033[0m"
 
@@ -64,15 +62,19 @@ def _console_fmt(label: str, color: str) -> logging.Formatter:
     return Fmt()
 
 
-def _file_fmt(label: str) -> logging.Formatter:
-    class Fmt(logging.Formatter):
-        def format(self, record: logging.LogRecord) -> str:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            return f"[{ts}][{label}][{record.levelname}] {record.getMessage()}"
-    return Fmt()
+class _ProcessorFilter(logging.Filter):
+    """Injects the processor label onto every record, for the queue_logs table."""
+
+    def __init__(self, processor: str) -> None:
+        super().__init__()
+        self.processor = processor
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.processor = self.processor
+        return True
 
 
-def _build_logger(name: str, label: str, color: str, log_file: str | None = None) -> logging.Logger:
+def _build_logger(name: str, label: str, color: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -84,12 +86,24 @@ def _build_logger(name: str, label: str, color: str, log_file: str | None = None
     ch.setFormatter(_console_fmt(label, color))
     logger.addHandler(ch)
 
-    if log_file:
-        fh = logging.FileHandler(log_file, mode="a")
-        fh.setFormatter(_file_fmt(label))
-        logger.addHandler(fh)
+    # Persist queue logs to Postgres (queue_logs table) instead of a local file.
+    db.init_db()
+    pg = db.PostgresLogHandler(table="queue_logs", extra_fields=("processor",))
+    pg.addFilter(_ProcessorFilter(label))
+    logger.addHandler(pg)
 
     return logger
+
+
+@contextmanager
+def _connection():
+    """Borrow a Postgres connection from the shared pool (db.py) and return it after."""
+    pool = db.get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -105,8 +119,6 @@ class QueueItem:
 @dataclass
 class ProcessorEntry:
     handler: Callable
-    priority: int       # order within a cycle — lower runs first
-    slots: int          # items to process per cycle — controls share of throughput
     logger: logging.Logger
     color: str
 
@@ -115,58 +127,37 @@ class ProcessorEntry:
 
 class QueueManager:
     """
-    Weighted round-robin queue manager with SQLite disk persistence.
+    FIFO queue manager with Postgres persistence (see db.py: queue_items table).
 
-    Jobs are written to queue.db the moment they are enqueued — no RAM list.
-    The worker reads one job at a time from disk, marks it 'processing', runs
-    it, then marks it 'done' or 'failed'. On restart, any 'processing' jobs
-    are automatically reset to 'pending' so nothing is lost.
-
-    Runtime controls:
-        set_priority(name, n)  — reorder processors in the cycle
-        set_slots(name, n)     — change throughput share per cycle
+    Jobs are written to Postgres the moment they are enqueued — no RAM list,
+    no SQLite file. Each processor type gets its own dedicated worker thread
+    that repeatedly pulls the oldest pending job for that type, marks it
+    'processing', runs it, then marks it 'done' or 'failed'. On restart, any
+    'processing' jobs are automatically reset to 'pending' so nothing is lost.
     """
 
-    def __init__(self, log_dir: str = ".") -> None:
-        self._log_dir = log_dir
+    def __init__(self) -> None:
         self._processors: dict[str, ProcessorEntry] = {}
         self._lock = threading.Lock()
         self._running = False
         self._worker_threads: list[threading.Thread] = []
         self._color_idx = 0
 
-        # ── SQLite disk queue ─────────────────────────────────────────────────
-        self._db_path = f"{log_dir}/queue.db"
-        self._db = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")  # safe concurrent reads/writes
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS queue_items (
-                item_id        TEXT PRIMARY KEY,
-                processor_name TEXT NOT NULL,
-                data           TEXT NOT NULL,
-                enqueue_time   REAL NOT NULL,
-                status         TEXT NOT NULL DEFAULT 'pending'
-            )
-        """)
-        self._db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_proc_status
-            ON queue_items (processor_name, status, enqueue_time)
-        """)
-        self._db.commit()
+        # ── Postgres-backed queue ────────────────────────────────────────────
+        db.init_db()
 
         # Any job left as 'processing' from a previous crash → reset to 'pending'
-        crashed = self._db.execute(
-            "SELECT COUNT(*) FROM queue_items WHERE status='processing'"
-        ).fetchone()[0]
-        if crashed:
-            self._db.execute("UPDATE queue_items SET status='pending' WHERE status='processing'")
-            self._db.commit()
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM queue_items WHERE status='processing'")
+            crashed = cur.fetchone()[0]
+            if crashed:
+                cur.execute("UPDATE queue_items SET status='pending' WHERE status='processing'")
+            conn.commit()
 
         self._mgr_logger = _build_logger(
             "queue.manager",
             "QUEUE",
             _QUEUE_COLOR,
-            f"{log_dir}/queue_manager.log",
         )
 
         if crashed:
@@ -180,16 +171,12 @@ class QueueManager:
         self,
         name: str,
         handler: Callable,
-        priority: int = 10,
-        slots: int = 1,
         color: str | None = None,
     ) -> None:
         """
         Register a processor.
 
-        priority  — order in each cycle (lower = runs before higher)
-        slots     — how many items this processor handles per cycle
-        handler   — sync or async callable(data: dict) -> Any
+        handler — sync or async callable(data: dict) -> Any
         """
         if color is None:
             color = _AUTO_COLORS[self._color_idx % len(_AUTO_COLORS)]
@@ -199,79 +186,47 @@ class QueueManager:
             f"queue.proc.{name}",
             name.upper(),
             color,
-            f"{self._log_dir}/{name}_queue.log",
         )
         entry = ProcessorEntry(
             handler=handler,
-            priority=priority,
-            slots=slots,
             logger=proc_logger,
             color=color,
         )
         with self._lock:
             self._processors[name] = entry
 
-        # Show how many pending jobs are already on disk for this processor
-        pending = self._db.execute(
-            "SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status='pending'",
-            (name,),
-        ).fetchone()[0]
+        # Show how many pending jobs are already queued in Postgres for this processor
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM queue_items WHERE processor_name=%s AND status='pending'",
+                (name,),
+            )
+            pending = cur.fetchone()[0]
 
-        proc_logger.info(f"Registered | priority={priority}  slots={slots}  pending_on_disk={pending}")
-        self._mgr_logger.info(
-            f"Registered '{name}'  priority={priority}  slots={slots}  pending_on_disk={pending}"
-        )
-
-    # ── Runtime controls ──────────────────────────────────────────────────────
-
-    def set_priority(self, name: str, priority: int) -> None:
-        """Change a processor's position within each cycle. Takes effect next cycle."""
-        with self._lock:
-            entry = self._processors.get(name)
-            if entry is None:
-                raise KeyError(f"No processor named '{name}'")
-            old = entry.priority
-            entry.priority = priority
-        entry.logger.info(f"Priority {old} → {priority}")
-        self._mgr_logger.info(f"'{name}' priority {old} → {priority}")
-
-    def set_slots(self, name: str, slots: int) -> None:
-        """
-        Change how many items this processor handles per cycle.
-        Takes effect at the start of the next cycle.
-
-        Increase to give more throughput. Decrease to yield more to others.
-        Example: kyc=3, summary=1  →  process 3 KYC then 1 Summary, repeat.
-        """
-        if slots < 1:
-            raise ValueError("slots must be >= 1")
-        with self._lock:
-            entry = self._processors.get(name)
-            if entry is None:
-                raise KeyError(f"No processor named '{name}'")
-            old = entry.slots
-            entry.slots = slots
-        entry.logger.info(f"Slots {old} → {slots}")
-        self._mgr_logger.info(f"'{name}' slots {old} → {slots}")
+        proc_logger.info(f"Registered | pending_on_disk={pending}")
+        self._mgr_logger.info(f"Registered '{name}'  pending_on_disk={pending}")
 
     # ── Enqueueing ────────────────────────────────────────────────────────────
 
     def enqueue(self, processor_name: str, data: Any) -> str:
-        """Write a job to disk queue. Returns item_id. Uses no RAM for the payload."""
+        """Insert a job into Postgres. Returns item_id. Uses no RAM for the payload."""
         with self._lock:
             if processor_name not in self._processors:
                 raise KeyError(f"No processor named '{processor_name}'")
-            item_id = f"{processor_name}_{datetime.now().strftime('%H%M%S%f')}"
-            self._db.execute(
+        item_id = f"{processor_name}_{datetime.now().strftime('%H%M%S%f')}"
+
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 "INSERT INTO queue_items (item_id, processor_name, data, enqueue_time, status) "
-                "VALUES (?, ?, ?, ?, 'pending')",
+                "VALUES (%s, %s, %s, %s, 'pending')",
                 (item_id, processor_name, json.dumps(data), time.time()),
             )
-            self._db.commit()
-            depth = self._db.execute(
-                "SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status='pending'",
+            cur.execute(
+                "SELECT COUNT(*) FROM queue_items WHERE processor_name=%s AND status='pending'",
                 (processor_name,),
-            ).fetchone()[0]
+            )
+            depth = cur.fetchone()[0]
+            conn.commit()
 
         self._processors[processor_name].logger.info(
             f"Enqueued {item_id}  |  queue depth={depth}"
@@ -281,25 +236,32 @@ class QueueManager:
         )
         return item_id
 
-    # ── Disk dequeue (atomic select + mark processing) ────────────────────────
+    # ── FIFO dequeue (atomic claim-oldest-pending) ────────────────────────────
 
     def _pop_item(self, processor_name: str) -> QueueItem | None:
-        """Take the oldest pending job from disk. Returns None if queue is empty."""
-        with self._lock:
-            row = self._db.execute(
-                "SELECT item_id, data, enqueue_time FROM queue_items "
-                "WHERE processor_name=? AND status='pending' "
-                "ORDER BY enqueue_time ASC LIMIT 1",
+        """Atomically claim the oldest pending job for this processor. None if empty."""
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE queue_items
+                SET status = 'processing'
+                WHERE item_id = (
+                    SELECT item_id FROM queue_items
+                    WHERE processor_name = %s AND status = 'pending'
+                    ORDER BY enqueue_time ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING item_id, data, enqueue_time
+                """,
                 (processor_name,),
-            ).fetchone()
+            )
+            row = cur.fetchone()
+            conn.commit()
             if row is None:
                 return None
             item_id, data_json, enqueue_time = row
-            self._db.execute(
-                "UPDATE queue_items SET status='processing' WHERE item_id=?",
-                (item_id,),
-            )
-            self._db.commit()
+
         return QueueItem(
             item_id=item_id,
             processor_name=processor_name,
@@ -308,44 +270,37 @@ class QueueManager:
         )
 
     def _mark_done(self, item_id: str) -> None:
-        with self._lock:
-            self._db.execute(
-                "UPDATE queue_items SET status='done' WHERE item_id=?", (item_id,)
-            )
-            self._db.commit()
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE queue_items SET status='done' WHERE item_id=%s", (item_id,))
+            conn.commit()
 
     def _mark_failed(self, item_id: str) -> None:
-        with self._lock:
-            self._db.execute(
-                "UPDATE queue_items SET status='failed' WHERE item_id=?", (item_id,)
-            )
-            self._db.commit()
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE queue_items SET status='failed' WHERE item_id=%s", (item_id,))
+            conn.commit()
 
     # ── Status ────────────────────────────────────────────────────────────────
 
     def status(self) -> dict[str, dict]:
-        with self._lock:
-            result = {}
+        result = {}
+        with _connection() as conn, conn.cursor() as cur:
             for name in self._processors:
-                row = self._db.execute(
-                    "SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status='pending'",
+                cur.execute(
+                    "SELECT COUNT(*) FROM queue_items WHERE processor_name=%s AND status='pending'",
                     (name,),
-                ).fetchone()
-                failed = self._db.execute(
-                    "SELECT COUNT(*) FROM queue_items WHERE processor_name=? AND status='failed'",
+                )
+                depth = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM queue_items WHERE processor_name=%s AND status='failed'",
                     (name,),
-                ).fetchone()[0]
-                result[name] = {
-                    "priority": self._processors[name].priority,
-                    "slots": self._processors[name].slots,
-                    "depth": row[0],
-                    "failed": failed,
-                }
-            return result
+                )
+                failed = cur.fetchone()[0]
+                result[name] = {"depth": depth, "failed": failed}
+        return result
 
     # ── Item execution ────────────────────────────────────────────────────────
 
-    def _run_item(self, item: QueueItem, slot_num: int, total_slots: int) -> None:
+    def _run_item(self, item: QueueItem, job_num: int) -> None:
         entry = self._processors[item.processor_name]
         log = entry.logger
 
@@ -353,12 +308,8 @@ class QueueManager:
         sep = "─" * 50
 
         log.info(sep)
-        slot_label = f"job #{slot_num}" if total_slots == -1 else f"slot {slot_num}/{total_slots}"
-        log.info(f"START  {item.item_id}  [{slot_label}]  waited {wait:.2f}s")
-        self._mgr_logger.info(
-            f"▶ [{item.processor_name.upper()}] {item.item_id}  "
-            f"slot {slot_num}/{total_slots}"
-        )
+        log.info(f"START  {item.item_id}  [job #{job_num}]  waited {wait:.2f}s")
+        self._mgr_logger.info(f"▶ [{item.processor_name.upper()}] {item.item_id}  job #{job_num}")
 
         t0 = time.monotonic()
         try:
@@ -406,7 +357,7 @@ class QueueManager:
 
             idle_logged = False
             job_num += 1
-            self._run_item(item, job_num, -1)  # -1 signals continuous (not slot-bounded) mode
+            self._run_item(item, job_num)
 
         entry.logger.info(f"Worker stopped after {job_num} jobs")
 
@@ -436,5 +387,4 @@ class QueueManager:
         self._running = False
         for t in self._worker_threads:
             t.join(timeout=timeout)
-        self._db.close()
         self._mgr_logger.info("QueueManager stopped")

@@ -22,12 +22,12 @@ import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 from datetime import datetime
 import io
-import urllib.request
 import traceback
 import sys
-import threading
 import psutil
 import time
+
+import db
 
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,6 @@ def upload_to_s3(local_zip_path, s3_bucket, s3_key):
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-
 LOG_LEVEL = "DEBUG"
 
 # ============================================================
@@ -92,174 +90,49 @@ structured_handler = logging.StreamHandler(sys.stdout)
 structured_handler.setFormatter(StructuredLogFormatter())
 logger.addHandler(structured_handler)
 
-# File handler for persistent logs
-log_file_path = Path(tempfile.gettempdir()) / "smart_aadhar_detector.log"
-file_handler = logging.FileHandler(log_file_path, mode='a')
-file_handler.setFormatter(StructuredLogFormatter())
-logger.addHandler(file_handler)
+# Persist all KYC logs and errors to Postgres (kyc_logs table) instead of a
+# local .log file.
+db.init_db()
+pg_handler = db.PostgresLogHandler(
+    table="kyc_logs",
+    extra_fields=("zip_name", "trace_id", "stage"),
+)
+pg_handler.setLevel(getattr(logging, LOG_LEVEL))
+logger.addHandler(pg_handler)
 
 logger.info("Logger initialized", extra={'zip_name': 'SYSTEM', 'trace_id': 'INIT', 'stage': 'SETUP'})
 
 
 # ============================================================
-# SLACK ALERT MANAGER
+# FAILURE RECORDER
 # ============================================================
-class SlackAlertManager:
+def record_failure(zip_name: str, error_details: dict, logs: list = None) -> None:
     """
-    Manages Slack alerts for S3 upload failures and system errors.
-    Only sends alerts for FAILED operations, never for successes.
+    Persist a processing failure to Postgres (kyc_logs) via the structured
+    logger. Replaces the old Slack alerting — errors land in the DB instead
+    of a webhook.
     """
-    
-    def __init__(self, webhook_url: str):
-        self.webhook_url = webhook_url
-        self._alert_cache = set()  # Prevent duplicate alerts
-        self._lock = threading.Lock()
-        
-    def _generate_alert_key(self, zip_name: str, error_type: str) -> str:
-        """Generate unique key to prevent duplicate alerts."""
-        return f"{zip_name}:{error_type}:{datetime.now().strftime('%Y-%m-%d %H')}"
-    
-    def send_alert(self, zip_name: str, error_details: dict, logs: list = None):
-        """
-        Send error alert to Slack webhook.
-        Only alerts on failures, never on success.
-        """
-        if not self.webhook_url:
-            logger.warning(
-                f"Slack webhook not configured. Cannot send alert for {zip_name}",
-                extra={'zip_name': zip_name, 'trace_id': error_details.get('trace_id', 'N/A'), 'stage': 'SLACK_ALERT'}
-            )
-            return False
-            
-        alert_key = self._generate_alert_key(zip_name, error_details.get('error_type', 'UNKNOWN'))
-        
-        with self._lock:
-            if alert_key in self._alert_cache:
-                logger.info(
-                    f"Duplicate alert suppressed for {zip_name}",
-                    extra={'zip_name': zip_name, 'trace_id': error_details.get('trace_id', 'N/A'), 'stage': 'SLACK_ALERT'}
-                )
-                return False
-            self._alert_cache.add(alert_key)
-        
-        # Build comprehensive error message
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        trace_id = error_details.get('trace_id', 'N/A')
-        
-        blocks = [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": "🚨 SmartAadharDetector S3 Upload Failure",
-                    "emoji": True
-                }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*ZIP File:*\n`{zip_name}`"},
-                    {"type": "mrkdwn", "text": f"*Timestamp:*\n{timestamp}"},
-                    {"type": "mrkdwn", "text": f"*Trace ID:*\n`{trace_id}`"},
-                    {"type": "mrkdwn", "text": f"*Error Type:*\n{error_details.get('error_type', 'UNKNOWN')}"}
-                ]
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Error Message:*\n```{error_details.get('error_message', 'No details available')}```"
-                }
-            }
-        ]
-        
-        # Add processing stage info
-        if 'stage' in error_details:
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Failed At Stage:*\n{error_details['stage']}"
-                }
-            })
-        
-        # Add S3 verification details
-        if 's3_verification' in error_details:
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*S3 Verification:*\n{error_details['s3_verification']}"
-                }
-            })
-        
-        # Add system info if available
-        if 'system_info' in error_details:
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*System Info:*\n```{json.dumps(error_details['system_info'], indent=2)}```"
-                }
-            })
-        
-        # Add recent logs
-        if logs:
-            log_text = "\n".join(logs[-20:])  # Last 20 log lines
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Recent Logs:*\n```{log_text[:2900]}```"  # Slack limit
-                }
-            })
-        
-        # Add traceback if available
-        if 'traceback' in error_details:
-            tb = error_details['traceback'][:2900]
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Traceback:*\n```{tb}```"
-                }
-            })
-        
-        payload = {
-            "text": f"S3 Upload Failure: {zip_name}",
-            "blocks": blocks,
-            "attachments": [{
-                "color": "danger",
-                "footer": "SmartAadharDetector Alert System"
-            }]
-        }
-        
-        try:
-            req = urllib.request.Request(
-                self.webhook_url,
-                data=json.dumps(payload).encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
-                method='POST'
-            )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.status == 200:
-                    logger.info(
-                        f"Slack alert sent successfully for {zip_name}",
-                        extra={'zip_name': zip_name, 'trace_id': trace_id, 'stage': 'SLACK_ALERT'}
-                    )
-                    return True
-        except Exception as e:
-            logger.error(
-                f"Failed to send Slack alert: {e}",
-                extra={'zip_name': zip_name, 'trace_id': trace_id, 'stage': 'SLACK_ALERT'}
-            )
-            return False
-        
-        return False
+    trace_id = error_details.get('trace_id', 'N/A')
+    parts = [f"FAILURE: {error_details.get('error_type', 'UNKNOWN')}"]
+    if error_details.get('error_message'):
+        parts.append(f"message={error_details['error_message']}")
+    if error_details.get('s3_verification'):
+        parts.append(f"s3_verification={error_details['s3_verification']}")
+    if error_details.get('system_info'):
+        parts.append(f"system_info={json.dumps(error_details['system_info'])}")
+    if logs:
+        parts.append(f"recent_logs={' | '.join(logs[-20:])}")
+    if error_details.get('traceback'):
+        parts.append(f"traceback={error_details['traceback']}")
 
-
-# Initialize Slack alert manager
-slack_alert = SlackAlertManager(SLACK_WEBHOOK_URL)
+    logger.error(
+        " | ".join(parts),
+        extra={
+            'zip_name': zip_name,
+            'trace_id': trace_id,
+            'stage': error_details.get('stage', 'FAILED'),
+        },
+    )
 
 
 # ============================================================
@@ -411,9 +284,9 @@ class ZipProcessingContext:
             return -1
         
     def send_failure_alert(self):
-        """Send Slack alert for this failure."""
+        """Persist this failure to Postgres (kyc_logs)."""
         if self.error_info:
-            slack_alert.send_alert(
+            record_failure(
                 zip_name=self.zip_name,
                 error_details=self.error_info,
                 logs=self.log_buffer
@@ -793,8 +666,8 @@ class SmartAadharDetector:
                     zip_context.log_s3_verification(s3_key, True, size)
                 return s3_key
 
-            # File is genuinely missing — send Slack alert with full logs
-            logger.error(f"File CONFIRMED MISSING from s3://{self.bucket_name}/{s3_key} — sending Slack alert",
+            # File is genuinely missing — record failure to Postgres
+            logger.error(f"File CONFIRMED MISSING from s3://{self.bucket_name}/{s3_key} — recording failure",
                         extra={'zip_name': zip_label, 'trace_id': trace_label, 'stage': 'S3_VERIFY'})
             if zip_context:
                 zip_context.error_info = {
@@ -1031,7 +904,9 @@ class SmartAadharDetector:
         else:
             print(f" {msg}")
 
-    def _extract_zip(self, zip_path: str, zip_context: ZipProcessingContext = None) -> list[Path]:
+    def _extract_zip(self, zip_path: str, zip_context: ZipProcessingContext = None) -> tuple[list[Path], Path | None]:
+        """Extract PDFs from a ZIP into a temp dir. Returns (pdf_files, temp_dir) —
+        the caller owns temp_dir and must remove it once done reading the PDFs."""
         zip_path = Path(zip_path)
 
         try:
@@ -1046,7 +921,7 @@ class SmartAadharDetector:
                 zip_context._log('ERROR', msg)
             else:
                 print(f" {msg}")
-            return []
+            return [], None
 
         if result.returncode != 0:
             msg = f"Not a valid or extractable ZIP: {zip_path}"
@@ -1056,7 +931,7 @@ class SmartAadharDetector:
             else:
                 print(f" {msg}")
                 print(result.stderr.strip() or result.stdout.strip())
-            return []
+            return [], None
 
         msg = f"ZIP validation passed: {zip_path}"
         if zip_context:
@@ -1082,7 +957,7 @@ class SmartAadharDetector:
                 zip_context._log('ERROR', msg)
             else:
                 print(f" {msg}")
-            return []
+            return [], temp_dir
 
         pdf_files = []
         for file_path in temp_dir.rglob("*"):
@@ -1094,7 +969,7 @@ class SmartAadharDetector:
             zip_context.log_extraction(len(pdf_files))
         else:
             print(f" {msg}")
-        return pdf_files
+        return pdf_files, temp_dir
 
     def get_latest_valid_pdf(self, pdffiles, zip_context: ZipProcessingContext = None):
         import re
@@ -1323,6 +1198,7 @@ class SmartAadharDetector:
 
                         # ====== NESTED ZIP CHECK ======
                         ctx.transition_to('EXTRACTION', "Checking for nested ZIPs...")
+                        extract_temp_dir = None  # set below if this is a non-nested ZIP; cleaned up in CLEANUP stage
                         with zipfile.ZipFile(zippath, 'r') as main_zip:
                             nested_zips = [f for f in main_zip.namelist() if f.lower().endswith('.zip')]
 
@@ -1359,7 +1235,7 @@ class SmartAadharDetector:
                                 ctx.log_extraction(len(pdffiles), nested=True)
                             
                             else:
-                                pdffiles = self._extract_zip(zippath, ctx)
+                                pdffiles, extract_temp_dir = self._extract_zip(zippath, ctx)
 
                             ctx._log('INFO', f"ALL PDFs ({len(pdffiles)}):")
                             for i, pdf in enumerate(pdffiles, 1):
@@ -1595,6 +1471,9 @@ class SmartAadharDetector:
                         if zip_root.exists():
                             shutil.rmtree(zip_root, ignore_errors=True)
                             ctx._log('INFO', f"Local folder removed: {zip_root}")
+                        if extract_temp_dir and extract_temp_dir.exists():
+                            shutil.rmtree(extract_temp_dir, ignore_errors=True)
+                            ctx._log('INFO', f"Local extracted PDFs removed: {extract_temp_dir}")
                             
                     except Exception as e:
                         ctx._log('ERROR', f"Exception in process_zip_as_one: {type(e).__name__}: {e}")
@@ -1603,8 +1482,8 @@ class SmartAadharDetector:
                         raise  # Re-raise to propagate
             except Exception as e:
                 if ctx is None:
-                    # ✅ __enter__ FAILED or exception before context started
-                    slack_alert.send_alert(
+                    # __enter__ FAILED or exception before context started
+                    record_failure(
                         zip_name=zip_name,
                         error_details={
                             'trace_id': 'NO_CTX',
@@ -1614,7 +1493,7 @@ class SmartAadharDetector:
                             'traceback': traceback.format_exc(),
                         }
                     )
-                # If ctx exists, alert was already sent inside. Just re-raise.
+                # If ctx exists, the failure was already recorded inside. Just re-raise.
                 raise
 
             logger.info(
