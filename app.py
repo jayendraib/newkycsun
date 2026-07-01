@@ -22,12 +22,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-import db
-from queue_system import QueueManager
-from kyc import SmartAadharDetector
-from summary import process_url
+load_dotenv()  # must run before local imports below, which read env vars at import time
 
-load_dotenv()
+import db  # noqa: E402
+from queue_system import QueueManager  # noqa: E402
+from kyc import SmartAadharDetector  # noqa: E402
+from summary import process_url  # noqa: E402
 
 # Initialise the Postgres log tables (kyc_logs, summary_logs, queue_logs).
 db.init_db()
@@ -49,9 +49,9 @@ KYC_INPUT_PREFIX = os.getenv("KYC_INPUT_PREFIX", "")
 
 WEBHOOK_URL = os.getenv(
     "SUMMARY_WEBHOOK_URL",
-    "",
+    "http://prod-api-new-internal.indiabonds.com:8080/marketnews/internapi/v1/news/ai-summary",
 )
-WEBHOOK_TOKEN = os.getenv("SUMMARY_WEBHOOK_TOKEN", "")
+WEBHOOK_TOKEN = os.getenv("SUMMARY_WEBHOOK_TOKEN", "Ind1Ab0nd$AiService#4@128689")
 
 KYC_AUTH_ID = os.getenv("KYC_AUTH_ID", "2f8f114c-e61e-41dc-b158-f6f25a121006")
 KYC_WEBHOOK_URL = os.getenv(

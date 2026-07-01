@@ -26,8 +26,6 @@ python-multipart
 transformers
 ollama
 httpx_retries
-celery[redis]
-redis
 psycopg2-binary
 opencv-python-headless>=4.13.0.90
 numpy>=2.4.0
@@ -37,10 +35,12 @@ easyocr>=1.7.2
 ultralytics>=8.4.9
 langchain-core>=0.3.81
 langchain-ollama>=0.3.10
-boto3>=1.42.39
+boto3==1.26.0
 torch>=2.10.0
 torchvision>=0.25.0
 torchaudio>=2.10.0
 omegaconf>=2.3.0
 poppler-utils>=0.1.0
-paddlepaddle==3.2.2
+paddlepaddle
+screen
+libgl1
